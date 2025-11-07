@@ -1,3 +1,2 @@
-selenium
-webdriver-manager
-keyboard
+selenium>=4.10.0
+webdriver-manager>=4.0.0

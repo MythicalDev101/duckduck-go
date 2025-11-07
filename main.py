@@ -1,230 +1,303 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+#!/usr/bin/env python3
+"""
+Read queries from input.txt, search DuckDuckGo for each query, click the first <h3> result (or a reasonable fallback),
+and write the resulting opened URL to output.txt.
+
+Usage:
+  python main.py --input input.txt --output output.txt [--headless]
+
+Notes:
+ - This script uses Selenium and webdriver-manager to auto-install ChromeDriver.
+ - Ensure Chrome is installed on your system.
+"""
+from __future__ import annotations
+
+import argparse
 import time
-import sys
-import os
-import traceback
-import threading
+from typing import List, Optional
+from urllib.parse import quote_plus
 
-# New: cross-check keyboard availability; fallback to msvcrt for console
-try:
-    import keyboard  # pip install keyboard
-    _KEYBOARD_AVAILABLE = True
-except Exception:
-    _KEYBOARD_AVAILABLE = False
-    try:
-        import msvcrt
-    except Exception:
-        msvcrt = None
+from selenium import webdriver
+from selenium.common.exceptions import (
+	NoSuchElementException,
+	TimeoutException,
+	WebDriverException,
+)
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.remote.webelement import WebElement
 
-# New globals for stopping and active driver reference
-stop_event = threading.Event()
-current_driver = None
 
-def on_f2_pressed():
-    # set stop flag and attempt to quit driver, then exit
-    stop_event.set()
-    try:
-        print("F2 pressed — stopping processes...", file=sys.stderr)
-    except Exception:
-        pass
-    try:
-        global current_driver
-        if current_driver:
-            try:
-                current_driver.quit()
-            except Exception:
-                pass
-    finally:
-        # force exit to ensure background threads stop
-        try:
-            os._exit(1)
-        except Exception:
-            raise SystemExit(1)
+def setup_driver(headless: bool = True):
+	options = webdriver.ChromeOptions()
+	if headless:
+		options.add_argument("--headless=new")
+	options.add_argument("--no-sandbox")
+	options.add_argument("--disable-gpu")
+	options.add_argument("--disable-dev-shm-usage")
+	# Optional: make automation slightly less detectable
+	options.add_experimental_option("excludeSwitches", ["enable-automation"])
+	options.add_experimental_option("useAutomationExtension", False)
 
-def start_key_listener():
-    if _KEYBOARD_AVAILABLE:
-        try:
-            # prefer add_hotkey which is simpler/reliable for a single key
-            keyboard.add_hotkey("f2", on_f2_pressed)
-        except Exception:
-            # fallback to on_press_key if add_hotkey isn't available
-            try:
-                keyboard.on_press_key("f2", lambda e: on_f2_pressed())
-            except Exception:
-                pass
-    elif msvcrt:
-        def _poll_console_keys():
-            while not stop_event.is_set():
-                try:
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch()
-                        # function keys return b'\x00' or b'\xe0' then code; F2 code is 60
-                        if ch in (b'\x00', b'\xe0'):
-                            ch2 = msvcrt.getch()
-                            if ch2 == bytes([60]):
-                                on_f2_pressed()
-                    time.sleep(0.05)
-                except Exception:
-                    break
-        t = threading.Thread(target=_poll_console_keys, daemon=True)
-        t.start()
-    else:
-        # no listener available
-        pass
+	service = Service(ChromeDriverManager().install())
+	driver = webdriver.Chrome(service=service, options=options)
+	driver.set_page_load_timeout(30)
+	return driver
 
-def get_first_result_url(query, headless=True, timeout=15, click_delay=1.5):
-    options = webdriver.ChromeOptions()
-    if headless:
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+def read_queries(path: str) -> List[str]:
+	queries: List[str] = []
+	with open(path, "r", encoding="utf-8") as f:
+		for line in f:
+			q = line.strip()
+			if q:
+				queries.append(q)
+	return queries
 
-    # publish driver so the listener can quit it
-    global current_driver
-    current_driver = driver
 
-    try:
-        driver.get("https://duckduckgo.com")
-        if stop_event.is_set():
-            raise KeyboardInterrupt("Stopped by user (F2)")
+def write_result(path: str, query: str, url: str) -> None:
+	with open(path, "a", encoding="utf-8") as f:
+		f.write(f"{query}\t{url}\n")
 
-        wait = WebDriverWait(driver, timeout)
-        search_box = wait.until(EC.presence_of_element_located((By.NAME, "q")))
-        if stop_event.is_set():
-            raise KeyboardInterrupt("Stopped by user (F2)")
-        search_box.clear()
-        search_box.send_keys(query)
-        search_box.send_keys(Keys.RETURN)
 
-        # wait for results to load (h3 titles present)
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h3")))
+def click_first_h3_or_fallback(driver: webdriver.Chrome, preferred_domains: Optional[List[str]] = None) -> str:
+	"""
+	Scan result anchors (h3 ancestors, DuckDuckGo result links, then generic anchors).
+	Prefer any link whose href contains a preferred domain (e.g. 'instagram.com').
+	If a preferred link is found, click/navigate to it; otherwise fall back to the first suitable link.
 
-        # optional short delay before interacting
-        elapsed = 0.0
-        while elapsed < click_delay:
-            if stop_event.is_set():
-                raise KeyboardInterrupt("Stopped by user (F2)")
-            time.sleep(0.1)
-            elapsed += 0.1
+	Returns the URL after navigation (or an error message).
+	"""
+	if preferred_domains is None:
+		preferred_domains = []
 
-        # locate the first h3 and its ancestor link (if any)
-        first_h3 = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h3")))
-        if stop_event.is_set():
-            raise KeyboardInterrupt("Stopped by user (F2)")
+	before_handles = driver.window_handles
 
-        parent_link = None
-        try:
-            parent_link = first_h3.find_element(By.XPATH, "./ancestor::a[1]")
-        except Exception:
-            parent_link = None
+	try:
+		# Wait for results to render (h3 or result links)
+		WebDriverWait(driver, 8).until(
+			lambda d: d.find_elements(By.TAG_NAME, "h3") or d.find_elements(By.CSS_SELECTOR, "a.result__a")
+		)
+	except TimeoutException:
+		pass
 
-        # remember current window(s) and URL
-        old_windows = driver.window_handles
-        old_url = driver.current_url
-        link_href = None
-        if parent_link:
-            try:
-                link_href = parent_link.get_attribute("href")
-            except Exception:
-                link_href = None
+	candidates: List[WebElement] = []
 
-        # click the element (prefer the anchor if present)
-        try:
-            if parent_link:
-                parent_link.click()
-            else:
-                # clickable h3 fallback
-                clickable_h3 = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "h3")))
-                clickable_h3.click()
-        except Exception:
-            # if click fails, fall back to returning href if available
-            if link_href:
-                return link_href
-            raise
+	# 1) Gather anchors that are ancestors of <h3>
+	try:
+		h3s = driver.find_elements(By.TAG_NAME, "h3")
+		for h in h3s:
+			try:
+				a = h.find_element(By.XPATH, "./ancestor::a[1]")
+			except NoSuchElementException:
+				try:
+					a = h.find_element(By.TAG_NAME, "a")
+				except NoSuchElementException:
+					a = None
+			if a is not None:
+				href = a.get_attribute("href")
+				if href and href.startswith("http"):
+					candidates.append(a)
+	except Exception:
+		pass
 
-        # wait for either a URL change or a new window/tab
-        end_time = time.time() + timeout
-        navigated_url = None
-        while time.time() < end_time:
-            if stop_event.is_set():
-                raise KeyboardInterrupt("Stopped by user (F2)")
-            # new window opened
-            current_windows = driver.window_handles
-            if len(current_windows) > len(old_windows):
-                new_handles = [h for h in current_windows if h not in old_windows]
-                if new_handles:
-                    try:
-                        driver.switch_to.window(new_handles[0])
-                        navigated_url = driver.current_url
-                        break
-                    except Exception:
-                        pass
-            # same window but URL changed
-            try:
-                if driver.current_url != old_url:
-                    navigated_url = driver.current_url
-                    break
-            except Exception:
-                pass
-            time.sleep(0.2)
+	# 2) DuckDuckGo result links
+	try:
+		ddg_links = driver.find_elements(By.CSS_SELECTOR, "a.result__a")
+		for a in ddg_links:
+			href = a.get_attribute("href")
+			if href and href.startswith("http"):
+				if a not in candidates:
+					candidates.append(a)
+	except Exception:
+		pass
 
-        # if nothing changed, fall back to the anchor href (if available)
-        if not navigated_url:
-            navigated_url = link_href or old_url
+	# 3) Generic anchors as last resort
+	try:
+		anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+		for a in anchors:
+			href = a.get_attribute("href")
+			if href and href.startswith("http") and "duckduckgo.com" not in href:
+				if a not in candidates:
+					candidates.append(a)
+	except Exception:
+		pass
 
-        return navigated_url
-    finally:
-        # clear global driver reference and quit
-        try:
-            current_driver = None
-        except Exception:
-            pass
-        try:
-            driver.quit()
-        except Exception:
-            pass
+	# Helper to click or navigate to an element
+	def _open_element(el: WebElement) -> str:
+		href = el.get_attribute("href")
+		try:
+			el.click()
+		except WebDriverException:
+			if href:
+				driver.get(href)
+		time.sleep(0.5)
+		after_handles = driver.window_handles
+		if len(after_handles) > len(before_handles):
+			try:
+				driver.switch_to.window(after_handles[-1])
+			except Exception:
+				pass
+		try:
+			WebDriverWait(driver, 10).until(lambda d: d.current_url and d.current_url != "about:blank")
+		except TimeoutException:
+			pass
+		return driver.current_url
+
+	# 4) Prefer links that match preferred_domains
+	if preferred_domains and candidates:
+		lower_prefs = [p.lower() for p in preferred_domains]
+		for el in candidates:
+			href = (el.get_attribute("href") or "").lower()
+			for pref in lower_prefs:
+				if pref in href:
+					return _open_element(el)
+
+	# 5) Fallback: open the first candidate
+	if candidates:
+		return _open_element(candidates[0])
+
+	return "ERROR: no suitable link found"
+
+
+def extract_preferred_href(driver: webdriver.Chrome, preferred_domains: Optional[List[str]] = None) -> str:
+	"""Return the href of a preferred candidate without clicking/navigating.
+
+	This uses the same candidate discovery order as the click function: h3 ancestor links,
+	DuckDuckGo result links, then generic external anchors. If a preferred domain is found it
+	returns that href, otherwise returns the first candidate href. Returns an error string
+	if nothing suitable is found.
+	"""
+	if preferred_domains is None:
+		preferred_domains = []
+
+	candidates: List[WebElement] = []
+
+	# 1) Gather anchors that are ancestors of <h3>
+	try:
+		h3s = driver.find_elements(By.TAG_NAME, "h3")
+		for h in h3s:
+			try:
+				a = h.find_element(By.XPATH, "./ancestor::a[1]")
+			except NoSuchElementException:
+				try:
+					a = h.find_element(By.TAG_NAME, "a")
+				except NoSuchElementException:
+					a = None
+			if a is not None:
+				href = a.get_attribute("href")
+				if href and href.startswith("http"):
+					candidates.append(a)
+	except Exception:
+		pass
+
+	# 2) DuckDuckGo result links
+	try:
+		ddg_links = driver.find_elements(By.CSS_SELECTOR, "a.result__a")
+		for a in ddg_links:
+			href = a.get_attribute("href")
+			if href and href.startswith("http"):
+				if a not in candidates:
+					candidates.append(a)
+	except Exception:
+		pass
+
+	# 3) Generic anchors as last resort
+	try:
+		anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+		for a in anchors:
+			href = a.get_attribute("href")
+			if href and href.startswith("http") and "duckduckgo.com" not in href:
+				if a not in candidates:
+					candidates.append(a)
+	except Exception:
+		pass
+
+	# Prefer links that match preferred_domains
+	if preferred_domains and candidates:
+		lower_prefs = [p.lower() for p in preferred_domains]
+		for el in candidates:
+			raw = el.get_attribute("href")
+			href = (raw or "").lower()
+			for pref in lower_prefs:
+				if pref in href:
+					return raw or ""
+
+	# Fallback: return the first candidate href
+	if candidates:
+		return candidates[0].get_attribute("href") or ""
+
+	return "ERROR: no suitable link found"
+
+
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--input", "-i", default="input.txt", help="Path to input file with queries")
+	parser.add_argument("--output", "-o", default="output.txt", help="Path to output file")
+	parser.add_argument("--prefer", "-p", default="instagram.com", help="Comma-separated list of preferred domains, e.g. instagram.com,facebook.com")
+	parser.add_argument("--click", action="store_true", help="Actually click/open the link (default: off). When off the script only extracts the preferred href without navigating.")
+	parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+	args = parser.parse_args()
+
+	# parse prefer list
+	prefer_list: Optional[List[str]] = None
+	if args.prefer:
+		prefer_list = [p.strip() for p in args.prefer.split(",") if p.strip()]
+
+	queries = read_queries(args.input)
+	if not queries:
+		print(f"No queries found in {args.input}")
+		return
+
+	print(f"Found {len(queries)} queries. Starting browser (headless={args.headless})...")
+	driver = setup_driver(headless=args.headless)
+
+	try:
+		for i, q in enumerate(queries, start=1):
+			print(f"[{i}/{len(queries)}] Searching for: {q}")
+			search_url = f"https://duckduckgo.com/?q={quote_plus(q)}"
+			try:
+				driver.get(search_url)
+			except WebDriverException as e:
+				print(f"Failed to load search page for '{q}': {e}")
+				write_result(args.output, q, f"ERROR: could not load search page: {e}")
+				continue
+
+			try:
+				if args.click:
+					# actually click and navigate
+					result_url = click_first_h3_or_fallback(driver, preferred_domains=prefer_list)
+				else:
+					# default: no-click mode, just extract preferred href
+					result_url = extract_preferred_href(driver, preferred_domains=prefer_list)
+			except Exception as e:
+				result_url = f"ERROR: exception during processing: {e}"
+
+			print(f" -> result: {result_url}")
+			write_result(args.output, q, result_url)
+
+			# Close any extra tabs/windows and return to a blank state before next query
+			handles = driver.window_handles
+			if len(handles) > 1:
+				main_handle = handles[0]
+				for h in handles[1:]:
+					try:
+						driver.switch_to.window(h)
+						driver.close()
+					except Exception:
+						pass
+				driver.switch_to.window(main_handle)
+
+			# small polite delay
+			time.sleep(1)
+
+	finally:
+		driver.quit()
+
 
 if __name__ == "__main__":
-    # start listener before heavy work
-    start_key_listener()
-    print("Key listener started (press F2 to stop).", file=sys.stderr)
+	main()
 
-    input_path = os.path.join(os.path.dirname(__file__), "input.txt")
-    output_path = os.path.join(os.path.dirname(__file__), "output.txt")
-
-    if not os.path.exists(input_path):
-        print("input.txt not found in project folder.", file=sys.stderr)
-        sys.exit(1)
-
-    query = open(input_path, "r", encoding="utf-8").read().strip()
-    if not query:
-        print("input.txt is empty.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        # run with visible browser for debugging
-        url = get_first_result_url(query, headless=False)
-    except KeyboardInterrupt:
-        print("Stopped by user (F2). Exiting.", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print("Search failed:", file=sys.stderr)
-        traceback.print_exc()
-        # also print raw exception (may be empty)
-        print(repr(e), file=sys.stderr)
-        sys.exit(1)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write((url or "").strip() + "\n")
-
-    print("Wrote first result URL to", output_path)
