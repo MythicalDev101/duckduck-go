@@ -1,303 +1,222 @@
-#!/usr/bin/env python3
-"""
-Read queries from input.txt, search DuckDuckGo for each query, click the first <h3> result (or a reasonable fallback),
-and write the resulting opened URL to output.txt.
-
-Usage:
-  python main.py --input input.txt --output output.txt [--headless]
-
-Notes:
- - This script uses Selenium and webdriver-manager to auto-install ChromeDriver.
- - Ensure Chrome is installed on your system.
-"""
-from __future__ import annotations
-
-import argparse
+import re
+import json
 import time
-from typing import List, Optional
-from urllib.parse import quote_plus
+import os
+import openpyxl
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-	NoSuchElementException,
-	TimeoutException,
-	WebDriverException,
-)
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.remote.webelement import WebElement
+SEARCH_URL = "https://duckduckgo.com/?q="
 
+# Load .env (optional)
+load_dotenv()
 
-def setup_driver(headless: bool = True):
-	options = webdriver.ChromeOptions()
-	if headless:
-		options.add_argument("--headless=new")
-	options.add_argument("--no-sandbox")
-	options.add_argument("--disable-gpu")
-	options.add_argument("--disable-dev-shm-usage")
-	# Optional: make automation slightly less detectable
-	options.add_experimental_option("excludeSwitches", ["enable-automation"])
-	options.add_experimental_option("useAutomationExtension", False)
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD")
+USER_DATA_DIR = os.getenv("USER_DATA_DIR", "persistent_profile")
+HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
-	service = Service(ChromeDriverManager().install())
-	driver = webdriver.Chrome(service=service, options=options)
-	driver.set_page_load_timeout(30)
-	return driver
+# ---------------------
+# Helpers
+# ---------------------
 
+def is_instagram_profile(url):
+    # Valid only if:
+    # instagram.com/<username>/  (ONLY one segment)
+    pattern = r"^https:\/\/www\.instagram\.com\/[^\/]+\/?$"
+    return re.match(pattern, url) is not None
 
-def read_queries(path: str) -> List[str]:
-	queries: List[str] = []
-	with open(path, "r", encoding="utf-8") as f:
-		for line in f:
-			q = line.strip()
-			if q:
-				queries.append(q)
-	return queries
+def scrape_instagram_profile(page):
+    """Extract followers, following, posts, and bio from Instagram profile using parent span logic."""
 
+    # Wait for body to load
+    page.wait_for_selector("body")
 
-def write_result(path: str, query: str, url: str) -> None:
-	with open(path, "a", encoding="utf-8") as f:
-		f.write(f"{query}\t{url}\n")
+    try:
+        # Extract bio
+        bio = page.locator("meta[name='description']").get_attribute("content") or "N/A"
 
+        def extract_stat(keyword):
+            """Find keyword in HTML, extract parent span, and retrieve content excluding the keyword."""
+            locator = page.locator(f"span:has-text('{keyword}')")
+            if not locator:
+                return "N/A"
 
-def click_first_h3_or_fallback(driver: webdriver.Chrome, preferred_domains: Optional[List[str]] = None) -> str:
-	"""
-	Scan result anchors (h3 ancestors, DuckDuckGo result links, then generic anchors).
-	Prefer any link whose href contains a preferred domain (e.g. 'instagram.com').
-	If a preferred link is found, click/navigate to it; otherwise fall back to the first suitable link.
+            parent_span = locator.nth(0).locator("..")  # Get parent span
+            content = parent_span.inner_text() or "N/A"
+            return content.replace(keyword, "").strip()
 
-	Returns the URL after navigation (or an error message).
-	"""
-	if preferred_domains is None:
-		preferred_domains = []
+        # Extract stats
+        posts = extract_stat("posts")
+        followers = extract_stat("followers")
+        following = extract_stat("following")
 
-	before_handles = driver.window_handles
+        return {
+            "bio": bio.strip(),
+            "followers": followers,
+            "following": following,
+            "posts": posts
+        }
 
-	try:
-		# Wait for results to render (h3 or result links)
-		WebDriverWait(driver, 8).until(
-			lambda d: d.find_elements(By.TAG_NAME, "h3") or d.find_elements(By.CSS_SELECTOR, "a.result__a")
-		)
-	except TimeoutException:
-		pass
-
-	candidates: List[WebElement] = []
-
-	# 1) Gather anchors that are ancestors of <h3>
-	try:
-		h3s = driver.find_elements(By.TAG_NAME, "h3")
-		for h in h3s:
-			try:
-				a = h.find_element(By.XPATH, "./ancestor::a[1]")
-			except NoSuchElementException:
-				try:
-					a = h.find_element(By.TAG_NAME, "a")
-				except NoSuchElementException:
-					a = None
-			if a is not None:
-				href = a.get_attribute("href")
-				if href and href.startswith("http"):
-					candidates.append(a)
-	except Exception:
-		pass
-
-	# 2) DuckDuckGo result links
-	try:
-		ddg_links = driver.find_elements(By.CSS_SELECTOR, "a.result__a")
-		for a in ddg_links:
-			href = a.get_attribute("href")
-			if href and href.startswith("http"):
-				if a not in candidates:
-					candidates.append(a)
-	except Exception:
-		pass
-
-	# 3) Generic anchors as last resort
-	try:
-		anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-		for a in anchors:
-			href = a.get_attribute("href")
-			if href and href.startswith("http") and "duckduckgo.com" not in href:
-				if a not in candidates:
-					candidates.append(a)
-	except Exception:
-		pass
-
-	# Helper to click or navigate to an element
-	def _open_element(el: WebElement) -> str:
-		href = el.get_attribute("href")
-		try:
-			el.click()
-		except WebDriverException:
-			if href:
-				driver.get(href)
-		time.sleep(0.5)
-		after_handles = driver.window_handles
-		if len(after_handles) > len(before_handles):
-			try:
-				driver.switch_to.window(after_handles[-1])
-			except Exception:
-				pass
-		try:
-			WebDriverWait(driver, 10).until(lambda d: d.current_url and d.current_url != "about:blank")
-		except TimeoutException:
-			pass
-		return driver.current_url
-
-	# 4) Prefer links that match preferred_domains
-	if preferred_domains and candidates:
-		lower_prefs = [p.lower() for p in preferred_domains]
-		for el in candidates:
-			href = (el.get_attribute("href") or "").lower()
-			for pref in lower_prefs:
-				if pref in href:
-					return _open_element(el)
-
-	# 5) Fallback: open the first candidate
-	if candidates:
-		return _open_element(candidates[0])
-
-	return "ERROR: no suitable link found"
+    except Exception as e:
+        print("Error scraping profile:", e)
+        return None
 
 
-def extract_preferred_href(driver: webdriver.Chrome, preferred_domains: Optional[List[str]] = None) -> str:
-	"""Return the href of a preferred candidate without clicking/navigating.
+def ensure_logged_in(page):
+    """
+    If the page shows a login form, fill it with credentials from .env.
+    Returns True if logged in (or login appears to have succeeded).
+    If INSTAGRAM_USERNAME/INSTAGRAM_PASSWORD are not set, the function
+    will simply return True (no-op).
+    """
 
-	This uses the same candidate discovery order as the click function: h3 ancestor links,
-	DuckDuckGo result links, then generic external anchors. If a preferred domain is found it
-	returns that href, otherwise returns the first candidate href. Returns an error string
-	if nothing suitable is found.
-	"""
-	if preferred_domains is None:
-		preferred_domains = []
+    # If credentials aren't provided, don't attempt to login.
+    if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+        print("No INSTAGRAM_USERNAME/INSTAGRAM_PASSWORD in .env — skipping automatic login.")
+        return True
 
-	candidates: List[WebElement] = []
+    page.goto("https://www.instagram.com/", timeout=60000)
+    time.sleep(2)
 
-	# 1) Gather anchors that are ancestors of <h3>
-	try:
-		h3s = driver.find_elements(By.TAG_NAME, "h3")
-		for h in h3s:
-			try:
-				a = h.find_element(By.XPATH, "./ancestor::a[1]")
-			except NoSuchElementException:
-				try:
-					a = h.find_element(By.TAG_NAME, "a")
-				except NoSuchElementException:
-					a = None
-			if a is not None:
-				href = a.get_attribute("href")
-				if href and href.startswith("http"):
-					candidates.append(a)
-	except Exception:
-		pass
+    # If we detect a login form, perform login
+    if page.query_selector("input[name='username']"):
+        print("Logging into Instagram using .env credentials...")
+        page.goto("https://www.instagram.com/accounts/login/", timeout=60000)
+        page.wait_for_selector("input[name='username']", timeout=20000)
+        page.fill("input[name='username']", INSTAGRAM_USERNAME)
+        page.fill("input[name='password']", INSTAGRAM_PASSWORD)
+        # submit
+        page.click("button[type='submit']")
 
-	# 2) DuckDuckGo result links
-	try:
-		ddg_links = driver.find_elements(By.CSS_SELECTOR, "a.result__a")
-		for a in ddg_links:
-			href = a.get_attribute("href")
-			if href and href.startswith("http"):
-				if a not in candidates:
-					candidates.append(a)
-	except Exception:
-		pass
+        # wait for an element that typically appears when logged in
+        try:
+            page.wait_for_selector("nav", timeout=20000)
+        except Exception:
+            # sometimes Instagram shows extra flows (save login, 2FA); give a short extra wait
+            time.sleep(5)
 
-	# 3) Generic anchors as last resort
-	try:
-		anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-		for a in anchors:
-			href = a.get_attribute("href")
-			if href and href.startswith("http") and "duckduckgo.com" not in href:
-				if a not in candidates:
-					candidates.append(a)
-	except Exception:
-		pass
+        # try to verify by visiting the profile page
+        try:
+            page.goto(f"https://www.instagram.com/{INSTAGRAM_USERNAME}/", timeout=60000)
+            time.sleep(2)
+        except Exception:
+            pass
 
-	# Prefer links that match preferred_domains
-	if preferred_domains and candidates:
-		lower_prefs = [p.lower() for p in preferred_domains]
-		for el in candidates:
-			raw = el.get_attribute("href")
-			href = (raw or "").lower()
-			for pref in lower_prefs:
-				if pref in href:
-					return raw or ""
+        # Basic heuristic: if URL does not contain 'accounts/login' or 'login', assume logged in
+        if "login" not in page.url:
+            print("Login appears successful.")
+            return True
+        else:
+            print("Login may have failed — please check credentials or handle 2FA manually.")
+            return False
+    else:
+        # No login form; likely already logged in or using persistent profile
+        print("Already logged into Instagram (or no visible login form).")
+        return True
 
-	# Fallback: return the first candidate href
-	if candidates:
-		return candidates[0].get_attribute("href") or ""
+# ---------------------
+# MAIN SCRIPT
+# ---------------------
 
-	return "ERROR: no suitable link found"
+def run():
+    # Load queries
+    with open("input.txt", "r", encoding="utf-8") as f:
+        queries = [q.strip() for q in f.readlines() if q.strip()]
 
+    # Prepare Excel
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    if ws is None:
+        raise RuntimeError("Failed to initialize Excel worksheet.")
 
-def main():
-	parser = argparse.ArgumentParser()
-	parser.add_argument("--input", "-i", default="input.txt", help="Path to input file with queries")
-	parser.add_argument("--output", "-o", default="output.txt", help="Path to output file")
-	parser.add_argument("--prefer", "-p", default="instagram.com", help="Comma-separated list of preferred domains, e.g. instagram.com,facebook.com")
-	parser.add_argument("--click", action="store_true", help="Actually click/open the link (default: off). When off the script only extracts the preferred href without navigating.")
-	parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
-	args = parser.parse_args()
+    ws.append(["Query", "Profile URL", "Followers", "Following", "Posts", "Bio"])
 
-	# parse prefer list
-	prefer_list: Optional[List[str]] = None
-	if args.prefer:
-		prefer_list = [p.strip() for p in args.prefer.split(",") if p.strip()]
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch_persistent_context(
+            user_data_dir=USER_DATA_DIR,
+            headless=False,  # Ensure non-headless mode for safer automation
+            channel="chrome"
+        )
 
-	queries = read_queries(args.input)
-	if not queries:
-		print(f"No queries found in {args.input}")
-		return
+        page = browser.new_page()
 
-	print(f"Found {len(queries)} queries. Starting browser (headless={args.headless})...")
-	driver = setup_driver(headless=args.headless)
+        # Ensure logged in (only attempts login if credentials are provided in .env)
+        try:
+            ok = ensure_logged_in(page)
+            if not ok:
+                print("Warning: Unable to assert successful login. You may need to manually login once.")
+        except Exception as e:
+            print("Warning: ensure_logged_in encountered an error:", e)
 
-	try:
-		for i, q in enumerate(queries, start=1):
-			print(f"[{i}/{len(queries)}] Searching for: {q}")
-			search_url = f"https://duckduckgo.com/?q={quote_plus(q)}"
-			try:
-				driver.get(search_url)
-			except WebDriverException as e:
-				print(f"Failed to load search page for '{q}': {e}")
-				write_result(args.output, q, f"ERROR: could not load search page: {e}")
-				continue
+        # Loop queries
+        for query in queries:
+            print(f"\n=== Searching for: {query} ===")
 
-			try:
-				if args.click:
-					# actually click and navigate
-					result_url = click_first_h3_or_fallback(driver, preferred_domains=prefer_list)
-				else:
-					# default: no-click mode, just extract preferred href
-					result_url = extract_preferred_href(driver, preferred_domains=prefer_list)
-			except Exception as e:
-				result_url = f"ERROR: exception during processing: {e}"
+            page.goto(SEARCH_URL + query)
+            page.wait_for_selector("h2")
 
-			print(f" -> result: {result_url}")
-			write_result(args.output, q, result_url)
+            # Grab result links
+            results = page.locator("a[data-testid='result-extras-url-link']").all()
 
-			# Close any extra tabs/windows and return to a blank state before next query
-			handles = driver.window_handles
-			if len(handles) > 1:
-				main_handle = handles[0]
-				for h in handles[1:]:
-					try:
-						driver.switch_to.window(h)
-						driver.close()
-					except Exception:
-						pass
-				driver.switch_to.window(main_handle)
+            instagram_profile_url = None
+            scraped_data = None
 
-			# small polite delay
-			time.sleep(1)
+            # Check first 5 results
+            for i, link in enumerate(results[:5]):
+                try:
+                    url = link.get_attribute("href")
+                except Exception as e:
+                    print("Error retrieving link attribute:", e)
+                    continue
 
-	finally:
-		driver.quit()
+                if not url:
+                    continue
+
+                print(f"Checking result {i+1}: {url}")
+
+                page.goto(url, timeout=60000)
+
+                if "instagram.com" in page.url:
+                    final_url = page.url.split("?")[0]  # clean tracking params
+
+                    if is_instagram_profile(final_url):
+                        print("✅ Valid Instagram profile:", final_url)
+
+                        instagram_profile_url = final_url
+                        scraped_data = scrape_instagram_profile(page)
+                        break
+                    else:
+                        print("❌ Not a profile link.")
+                else:
+                    print("❌ Not Instagram.")
+
+            # Ensure workbook and worksheet are initialized
+            if ws is None:
+                raise ValueError("Worksheet initialization failed. Ensure the workbook is correctly created.")
+
+            # Safely handle NoneType for scraped_data
+            if scraped_data is None:
+                scraped_data = {"followers": "N/A", "following": "N/A", "posts": "N/A", "bio": "N/A"}
+
+            if instagram_profile_url:
+                ws.append([
+                    query,
+                    instagram_profile_url,
+                    scraped_data.get("followers", "N/A"),
+                    scraped_data.get("following", "N/A"),
+                    scraped_data.get("posts", "N/A"),
+                    scraped_data.get("bio", "N/A")
+                ])
+            else:
+                ws.append([query, "Profile Not Found", "", "", "", ""])
+
+            wb.save("instagram_results.xlsx")
+            # Add delay to reduce likelihood of being flagged
+            time.sleep(5)  # 5-second delay between actions
+
+    print("\n✅ Done! Saved to instagram_results.xlsx")
 
 
 if __name__ == "__main__":
-	main()
-
+    run()
